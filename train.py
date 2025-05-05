@@ -14,6 +14,7 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, balanced_accuracy_score
 import joblib
+import pickle
 
 from data import CATEGORY_IDS
 from data import GraphDataset, TextGraphDataset, GloVeTokenizer
@@ -52,6 +53,13 @@ def config():
     max_epochs = 40
     checkpoint = None
     use_cached_text = False
+
+
+def ktz_add_preds(agg, idx2ent, hts, rs, preds):
+    idxs = torch.argsort(preds, dim=-1, descending=True)
+    for h, r, ps in zip(hts, rs, idxs):
+        tup = idx2ent[h].item(), r.item()
+        agg[tup] = idx2ent[ps].tolist()
 
 
 @ex.capture
@@ -125,7 +133,19 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
     num_predictions = 0
     _log.info('Computing metrics on set of triples')
     total = len(triples_loader) if max_num_batches is None else max_num_batches
-    for i, triples in enumerate(triples_loader):
+
+    # --- KTZ
+    ktz_idx2ent = -torch.ones((len(ent2idx), ), dtype=torch.long)
+    ktz_idx2ent[ent2idx] = torch.arange(len(ent2idx))
+
+    ktz_head_preds = {}  # dict[tuple[VID, RID], list[VID]]
+    ktz_tail_preds = {}  # dict[tuple[VID, RID], list[VID]]
+
+    from itertools import islice
+
+    for i, triples in islice(enumerate(triples_loader), None):
+        # --- /KTZ
+
         if max_num_batches is not None and i == max_num_batches:
             break
 
@@ -145,6 +165,11 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
         # Score all possible heads and tails
         heads_predictions = model.score_fn(ent_emb, tail_embs, rel_embs)
         tails_predictions = model.score_fn(head_embs, ent_emb, rel_embs)
+
+        # --- KTZ
+        ktz_add_preds(ktz_tail_preds, ktz_idx2ent, heads, rels, tails_predictions)
+        ktz_add_preds(ktz_head_preds, ktz_idx2ent, tails, rels, heads_predictions)
+        # --- /KTZ
 
         pred_ents = torch.cat((heads_predictions, tails_predictions))
         true_ents = torch.cat((heads, tails))
@@ -189,6 +214,19 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
 
         if (i + 1) % int(0.2 * total) == 0:
             _log.info(f'[{i + 1:,}/{total:,}]')
+
+    # KTZ
+    ktz_fname = f"{text_dataset.directory.split('/')[-1]}-{prefix}.pkl"
+
+    with open(ktz_fname, mode='wb') as fd:
+        _log.info(f'[KTZ] writing {ktz_fname}')
+        pickle.dump(
+            {
+                'head predictions': ktz_head_preds,
+                'tail predictions': ktz_tail_preds,
+            }, fd)
+
+    # /KTZ
 
     _log.info(f'The total number of predictions is {num_predictions:,}')
     for hits_dict in (hits_at_k, hits_at_k_filt):
